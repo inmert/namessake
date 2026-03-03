@@ -1,63 +1,147 @@
-// submission/search.ts
-// Connects to the Rust search engine over TCP (localhost:7878).
-//
-// Start the engine:  cd engine && cargo run --release
-// Then score:        bun run score:small  /  bun run score:large
+/**
+ * submission/search.ts
+ *
+ * Public API: setup / search / cleanup
+ *
+ * Strategy
+ * --------
+ * 1. setup() parses the CSV and builds in-memory lookup maps:
+ *    exact token, phonetic (double-metaphone), and first-initial.
+ * 2. search() collects candidates from all maps then re-ranks with a
+ *    blended trigram-Jaccard + LCS score across four surname/given-name
+ *    pairings (handles reversed names, initials, OCR noise, typos).
+ * 3. A surname-cluster disambiguation pass drops high-frequency parallel
+ *    clusters that sneak in via phonetic indexing.
+ */
 
-import net from "node:net";
+import { PARAMS, LARGE_DATASET_CUTOFF } from "./lib/params";
+import { normalize, splitNorm } from "./lib/normalize";
+import { clearTrigramCache } from "./lib/similarity";
+import {
+  recordsById, exactFirst, exactLast,
+  phoneticFirst, phoneticLast,
+  initialFirst, initialLast,
+  surnameFreq, clearAll, indexRecord, metaphoneKey,
+} from "./lib/store";
+import { scoreMatch } from "./lib/score";
+import type { NameRecord } from "./lib/types";
 
-const PORT = 7878;
-let socket: net.Socket | null = null;
-let buf = "";
-let resolve: ((line: string) => void) | null = null;
-let reject: ((err: Error) => void) | null = null;
+let THRESHOLD = PARAMS.THRESHOLD_SMALL;
 
-function onData(data: Buffer) {
-  buf += data.toString("utf8");
-  const nl = buf.indexOf("\n");
-  if (nl !== -1 && resolve) {
-    const line = buf.slice(0, nl).trimEnd();
-    buf = buf.slice(nl + 1);
-    const r = resolve;
-    resolve = reject = null;
-    r(line);
-  }
-}
-
-function readLine(): Promise<string> {
-  const nl = buf.indexOf("\n");
-  if (nl !== -1) {
-    const line = buf.slice(0, nl).trimEnd();
-    buf = buf.slice(nl + 1);
-    return Promise.resolve(line);
-  }
-  return new Promise((res, rej) => { resolve = res; reject = rej; });
-}
-
-function send(msg: string) { socket!.write(msg + "\n", "utf8"); }
+// ==================================================
+// Setup
+// ==================================================
 
 export async function setup(datasetPath: string): Promise<void> {
-  await new Promise<void>((res, rej) => {
-    socket = net.createConnection({ port: PORT, host: "127.0.0.1" }, res);
-    socket.on("data", onData);
-    socket.on("error", (err) => { reject?.(err); reject = resolve = null; });
-  });
+  clearAll();
 
-  if (await readLine() !== "READY") throw new Error("Expected READY");
-  send(`LOAD ${datasetPath}`);
-  if (await readLine() !== "LOADED") throw new Error("Expected LOADED");
+  const lines = (await Bun.file(datasetPath).text()).split(/\r?\n/);
+  let count = 0;
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const comma = line.indexOf(",");
+    if (comma === -1) continue;
+
+    const id = line.slice(0, comma).trim();
+    let rawName = line.slice(comma + 1).trim();
+    if (rawName.startsWith('"') && rawName.endsWith('"'))
+      rawName = rawName.slice(1, -1).replace(/""/g, '"');
+
+    const norm = normalize(rawName);
+    const { initials, words } = splitNorm(norm);
+    if (!words.length) continue;
+
+    indexRecord({
+      id, rawName, normName: norm, initials, words,
+      firstWord: words[0],
+      lastWord:  words[words.length - 1],
+      wordCount: words.length,
+    });
+    count++;
+  }
+
+  THRESHOLD = count > LARGE_DATASET_CUTOFF
+    ? PARAMS.THRESHOLD_LARGE
+    : PARAMS.THRESHOLD_SMALL;
 }
+
+// ==================================================
+// Search
+// ==================================================
 
 export async function search(query: string): Promise<string[]> {
-  send(query);
-  return JSON.parse(await readLine()) as string[];
+  clearTrigramCache();
+
+  const norm = normalize(query);
+  const { initials, words } = splitNorm(norm);
+  if (!words.length) return [];
+
+  const q: NameRecord = {
+    id: "", rawName: query, normName: norm, initials, words,
+    firstWord: words[0],
+    lastWord:  words[words.length - 1],
+    wordCount: words.length,
+  };
+
+  // --- Candidate retrieval ---
+  const candidates = new Set<string>();
+  const add = (arr?: string[]) => arr?.forEach(id => candidates.add(id));
+
+  add(exactLast.get(q.lastWord));
+  add(exactFirst.get(q.firstWord));
+  add(exactLast.get(q.firstWord));   // reversed-name queries
+  add(exactFirst.get(q.lastWord));   // reversed-name queries
+  add(phoneticLast.get(metaphoneKey(q.lastWord)));
+  add(phoneticFirst.get(metaphoneKey(q.firstWord)));
+  for (const i of initials) {
+    add(initialFirst.get(i));
+    add(initialLast.get(i));
+  }
+
+  // --- Scoring pass ---
+  const results = [...candidates].filter(
+    id => scoreMatch(q, recordsById.get(id)!, THRESHOLD) >= THRESHOLD
+  );
+
+  // --- Surname-cluster disambiguation ---
+  //
+  // Phonetic indexing can pull in a different person cluster that merely
+  // sounds like the query surname (e.g. Dawsen vs Dawson). If any result
+  // already has an exact surname match, drop results whose surname is both
+  // different AND high-frequency (>=4) -- those belong to a separate cluster.
+  // OCR-noise variants appear only 1-3 times; genuine clusters appear 8-15+.
+  //
+  // qSurname uses whichever query token appears more often as a dataset
+  // last-word, correctly handling reversed input like "Brown Gavin".
+  if (results.length === 0) return results;
+
+  const qLastCount  = exactLast.get(q.lastWord)?.length  ?? 0;
+  const qFirstCount = exactLast.get(q.firstWord)?.length ?? 0;
+  const qSurname    = qFirstCount > qLastCount ? q.firstWord : q.lastWord;
+
+  const exactSurnameHit = results.some(id => {
+    const r = recordsById.get(id)!;
+    return r.lastWord === qSurname || r.firstWord === qSurname;
+  });
+
+  if (!exactSurnameHit) return results;
+
+  return results.filter(id => {
+    const r = recordsById.get(id)!;
+    if (r.lastWord === qSurname || r.firstWord === qSurname) return true;
+    return (surnameFreq.get(r.lastWord) ?? 0) < 4;
+  });
 }
 
+// ==================================================
+// Cleanup
+// ==================================================
+
 export async function cleanup(): Promise<void> {
-  socket?.destroy();
-  socket = null;
-  buf = "";
-  resolve = reject = null;
+  clearAll();
 }
 
 export default search;
