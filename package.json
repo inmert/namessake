@@ -12,6 +12,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@elastic/elasticsearch": "^9.3.2",
     "pg": "^8.19.0"
   }
 }

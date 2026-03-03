@@ -1,11 +1,16 @@
 // submission/search.ts
+// Architecture: Elasticsearch for candidate retrieval at scale,
+//               existing scoreMatch() for precision re-ranking.
+//
+// Uses Bun-native fetch() to talk to ES directly — no @elastic/elasticsearch
+// client transport layer, which is incompatible with Bun's HTTP runtime.
 
 // ==================================================
-// Tunable Parameters (Simple + Stable)
+// Tunable Parameters (unchanged)
 // ==================================================
 
 export const PARAMS = {
-  SURNAME_FLOOR: 0.5,        // was 0.38
+  SURNAME_FLOOR: 0.5,
   BOTH_FIRST_MIN: 0.7,
   THRESHOLD_SMALL: 0.64,
   THRESHOLD_LARGE: 0.655,
@@ -26,21 +31,66 @@ interface NameRecord {
   wordCount: number;
 }
 
-let records: NameRecord[] = [];
-const trigramIndex = new Map<string, Set<number>>();
-const dmIndex     = new Map<string, Set<number>>();   // DM code → record indices
+// Stored in ES — superset of NameRecord with extra search fields
+interface ESDoc {
+  record_id: string;
+  rawName: string;
+  normName: string;
+  initials: string[];
+  words: string[];
+  firstWord: string;
+  lastWord: string;
+  wordCount: number;
+  dm_codes: string[];
+  // Text fields ES actually searches on
+  first_name: string;
+  last_name: string;
+}
+
+// ── Elasticsearch connection ──────────────────────────────────────────────
+// All ES calls go through esRequest() using Bun's native fetch.
+// No @elastic/* client is needed — avoids Undici/Bun incompatibility.
+
+let ES_BASE  = (process.env.ES_URL ?? "http://localhost:9200").replace(/\/$/, "");
+let ES_INDEX = "names_search";
+let THRESHOLD = PARAMS.THRESHOLD_SMALL;
+const LARGE_DATASET_CUTOFF = 5000;
+
+// Per-query memoisation cache for trigram sets (same role as before)
 let trigramCache = new Map<string, Set<string>>();
+
+// How many candidates ES returns before re-ranking filter
+const ES_CANDIDATE_SIZE = 300;
+
+// ── Thin fetch wrapper ────────────────────────────────────────────────────
+
+async function esRequest(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<any> {
+  const url  = `${ES_BASE}${path}`;
+  const init: RequestInit = { method, headers: { "Content-Type": "application/json" } };
+  if (body !== undefined) init.body = JSON.stringify(body);
+  const res = await fetch(url, init);
+  const text = await res.text();
+  if (!res.ok) throw new Error(`ES ${method} ${path} → ${res.status}: ${text}`);
+  return text ? JSON.parse(text) : {};
+}
+
+const INITIAL_MATCH  = 0.8;
+const MISSING_FIRST  = 0.6;
+const INITIAL_SOFT   = 0.30;
+const INITIAL_HARD   = 0.0;
 
 // ==================================================
 // Double Metaphone  (Lawrence Philips / faithful port)
-// Returns up to two 4-char phonetic codes.
 // ==================================================
 
 function doubleMetaphone(word: string): string[] {
   const VOWELS = "AEIOUY";
   word = word.toUpperCase();
 
-  // Strip silent leading pairs
   if (/^(GN|KN|PN|AE|WR)/.test(word)) word = word.slice(1);
 
   const len  = word.length;
@@ -58,13 +108,11 @@ function doubleMetaphone(word: string): string[] {
 
   let i = 0;
 
-  // Initial vowel → "A"
   if (VOWELS.includes(word[0])) { add("A"); i = 1; }
 
   while (i < len) {
     const c = get(i);
 
-    // Skip standalone vowels after position 0
     if (VOWELS.includes(c) && i > 0) { i++; continue; }
 
     switch (c) {
@@ -293,27 +341,22 @@ function doubleMetaphone(word: string): string[] {
     }
   }
 
-  // Return deduplicated, non-empty codes (max 4 chars each)
   const codes = [p.slice(0,4), s.slice(0,4)].filter(Boolean);
   return codes[0] === codes[1] ? [codes[0]] : codes.filter((v,idx,arr) => arr.indexOf(v) === idx);
 }
 
-let THRESHOLD = PARAMS.THRESHOLD_SMALL;
-const LARGE_DATASET_CUTOFF = 5000;
+// ==================================================
+// Regex constants
+// ==================================================
 
-const INITIAL_MATCH = 0.8;
-const MISSING_FIRST = 0.6;
-const INITIAL_SOFT = 0.30;
-const INITIAL_HARD = 0.0;
-
-const SUFFIX_RE = /\b(Jr\.?|Sr\.?|II|III|IV)\b/gi;
-const COMMA_RE = /^([^,]+),\s*(.+)$/;
-const INITIAL_RE = /^[a-z]\.$/;
+const SUFFIX_RE      = /\b(Jr\.?|Sr\.?|II|III|IV)\b/gi;
+const COMMA_RE       = /^([^,]+),\s*(.+)$/;
+const INITIAL_RE     = /^[a-z]\.$/;
 const JUNK_PREFIX_RE = /^[a-z][A-Z]/;
-const CONCAT_X_RE = /([a-z])x([A-Z])/g;
+const CONCAT_X_RE    = /([a-z])x([A-Z])/g;
 
 // ==================================================
-// Normalization
+// Normalization (unchanged)
 // ==================================================
 
 function normalize(name: string): string {
@@ -350,7 +393,7 @@ function splitNorm(norm: string) {
 }
 
 // ==================================================
-// Similarity
+// Similarity (unchanged)
 // ==================================================
 
 function trigrams(s: string): Set<string> {
@@ -401,17 +444,17 @@ const tokenSim = (a: string, b: string) =>
   (trigramJaccard(a, b) + seqSim(a, b)) / 2;
 
 // ==================================================
-// Core Scoring (Simplified + Stable)
+// Core Scoring (unchanged from original)
 // ==================================================
 
 function scoreMatch(q: NameRecord, r: NameRecord): number {
   if (!q.words.length || !r.words.length) return 0;
 
   const pairings: [string, string, boolean][] = [
-    [q.lastWord, r.lastWord, false],
+    [q.lastWord,  r.lastWord,  false],
     [q.firstWord, r.firstWord, true],
-    [q.lastWord, r.firstWord, false],
-    [q.firstWord, r.lastWord, false],
+    [q.lastWord,  r.firstWord, false],
+    [q.firstWord, r.lastWord,  false],
   ];
 
   let best = 0;
@@ -423,19 +466,17 @@ function scoreMatch(q: NameRecord, r: NameRecord): number {
     seen.add(key);
 
     const lastSim = tokenSim(qLN, rLN);
-
-    // 🔒 Stronger surname gate
     if (lastSim < PARAMS.SURNAME_FLOOR) continue;
 
     const qfw = q.words.filter(w => w !== qLN);
     const rfw = r.words.filter(w => w !== rLN);
 
-    let firstScore = 0;
+    let firstScore    = 0;
     let initialMatched = false;
 
     for (const init of q.initials)
       if (rfw[0]?.startsWith(init)) {
-        firstScore = INITIAL_MATCH;
+        firstScore     = INITIAL_MATCH;
         initialMatched = true;
         break;
       }
@@ -443,7 +484,7 @@ function scoreMatch(q: NameRecord, r: NameRecord): number {
     if (!initialMatched)
       for (const init of r.initials)
         if (qfw[0]?.startsWith(init)) {
-          firstScore = INITIAL_MATCH;
+          firstScore     = INITIAL_MATCH;
           initialMatched = true;
           break;
         }
@@ -459,10 +500,6 @@ function scoreMatch(q: NameRecord, r: NameRecord): number {
         if (firstScore > 0.8) break;
       }
     } else if (!qfw.length && !rfw.length) {
-      // Both sides have no first-name words beyond the anchor.
-      // When BOTH sides carry initials, compare them directly so that
-      // "A. Moen" does not match "D. Moen" (different people, different initials).
-      // If only one side has initials (or neither does), fall back to MISSING_FIRST.
       if (q.initials.length > 0 && r.initials.length > 0) {
         const initMatch = q.initials.some(qi => r.initials.some(ri => qi === ri));
         firstScore = initMatch ? INITIAL_MATCH : 0;
@@ -479,20 +516,10 @@ function scoreMatch(q: NameRecord, r: NameRecord): number {
         : MISSING_FIRST;
     }
 
-    if (bothFirst && firstScore < PARAMS.BOTH_FIRST_MIN)
-      continue;
-
-    // Require a minimum first-name score so that an exact or near-exact surname
-    // cannot drag an otherwise weak first-name match over the threshold.
-    // e.g. "Tina Botsford" must not match query "Rosina Botsford" (sim≈0.44),
-    //      "Marion Lowe" must not match query "Marlne Lowe" (sim≈0.45),
-    //      "Sandrine Lowe" must not match (sim≈0.35).
-    // Genuine typo pairs (felix/fehx=0.48, marlne/marlene=0.73, etc.) all clear 0.45.
+    if (bothFirst && firstScore < PARAMS.BOTH_FIRST_MIN) continue;
     if (firstScore < 0.45) continue;
 
-    // 50/50 weighting restored
     const combined = 0.5 * lastSim + 0.5 * firstScore;
-
     if (combined > best) best = combined;
     if (best > THRESHOLD + 0.15) break;
   }
@@ -501,7 +528,7 @@ function scoreMatch(q: NameRecord, r: NameRecord): number {
 }
 
 // ==================================================
-// CSV Parsing
+// CSV Parsing (unchanged)
 // ==================================================
 
 function parseCsvLine(line: string): [string, string] | null {
@@ -516,68 +543,132 @@ function parseCsvLine(line: string): [string, string] | null {
 }
 
 // ==================================================
-// Setup / Search / Cleanup
+// Setup — parse CSV → bulk-index into Elasticsearch
 // ==================================================
 
-export async function setup(datasetPath: string) {
-  records = [];
-  trigramIndex.clear();
+export async function setup(datasetPath: string): Promise<void> {
+  ES_BASE  = (process.env.ES_URL ?? "http://localhost:9200").replace(/\/$/, "");
+  ES_INDEX = `names_search_${Date.now()}`;
 
+  // ── Create index with custom analyzer + mappings ──────────────────────────
+  await esRequest("PUT", `/${ES_INDEX}`, {
+    settings: {
+      analysis: {
+        analyzer: {
+          name_analyzer: {
+            type: "custom",
+            tokenizer: "standard",
+            filter: ["lowercase", "asciifolding"],
+          },
+        },
+      },
+      index: {
+        number_of_shards:   1,
+        number_of_replicas: 0,
+        refresh_interval:   "-1",   // disabled during bulk load
+      },
+    },
+    mappings: {
+      properties: {
+        record_id:  { type: "keyword" },
+        rawName:    { type: "keyword" },
+        normName:   { type: "keyword" },
+        initials:   { type: "keyword" },
+        words:      { type: "keyword" },
+        firstWord:  { type: "keyword" },
+        lastWord:   { type: "keyword" },
+        wordCount:  { type: "integer" },
+        dm_codes:   { type: "keyword" },
+        first_name: {
+          type:     "text",
+          analyzer: "name_analyzer",
+          fields: { keyword: { type: "keyword" } },
+        },
+        last_name: {
+          type:     "text",
+          analyzer: "name_analyzer",
+          fields: { keyword: { type: "keyword" } },
+        },
+      },
+    },
+  });
+
+  // ── Parse CSV ─────────────────────────────────────────────────────────────
   const lines = (await Bun.file(datasetPath).text()).split(/\r?\n/);
-  records = new Array(lines.length - 1);
-
+  const bulkOps: object[] = [];
   let count = 0;
 
-  for (let i = 1; i < lines.length; i++) {
-    const parsed = parseCsvLine(lines[i].trim());
+  for (let li = 1; li < lines.length; li++) {
+    const parsed = parseCsvLine(lines[li].trim());
     if (!parsed) continue;
 
     const [id, rawName] = parsed;
-    const normName = normalize(rawName);
+    const normName      = normalize(rawName);
     const { initials, words } = splitNorm(normName);
     if (!words.length) continue;
 
-    const rec: NameRecord = {
-      id,
+    const dmSet = new Set<string>();
+    for (const w of words)
+      for (const code of doubleMetaphone(w)) dmSet.add(code);
+
+    const doc: ESDoc = {
+      record_id: id,
       rawName,
       normName,
       initials,
       words,
       firstWord: words[0],
-      lastWord: words[words.length - 1],
+      lastWord:  words[words.length - 1],
       wordCount: words.length,
+      dm_codes:  [...dmSet],
+      first_name: words[0],
+      last_name:  words[words.length - 1],
     };
 
-    records[count] = rec;
-
-    for (const w of words) {
-      // Trigram index
-      for (const tg of trigrams(w)) {
-        let set = trigramIndex.get(tg);
-        if (!set) trigramIndex.set(tg, (set = new Set()));
-        set.add(count);
-      }
-      // Double Metaphone index
-      for (const code of doubleMetaphone(w)) {
-        let set = dmIndex.get(code);
-        if (!set) dmIndex.set(code, (set = new Set()));
-        set.add(count);
-      }
-    }
-
+    bulkOps.push({ index: { _index: ES_INDEX, _id: id } });
+    bulkOps.push(doc);
     count++;
   }
 
-  records.length = count;
+  // ── Bulk index via NDJSON ─────────────────────────────────────────────────
+  // ES bulk endpoint expects newline-delimited JSON (not a JSON array).
+  const BATCH_DOCS = 500;
+  for (let b = 0; b < bulkOps.length; b += BATCH_DOCS * 2) {
+    const slice = bulkOps.slice(b, b + BATCH_DOCS * 2);
+    const ndjson = slice.map(o => JSON.stringify(o)).join("\n") + "\n";
+
+    const res = await fetch(`${ES_BASE}/_bulk`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/x-ndjson" },
+      body:    ndjson,
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(`Bulk index failed ${res.status}: ${t}`);
+    }
+    const resp = await res.json() as { errors: boolean; items: any[] };
+    if (resp.errors) {
+      const errs = resp.items.filter(i => i.index?.error);
+      if (errs.length) console.error("Bulk index errors:", errs.slice(0, 3));
+    }
+  }
+
+  // Re-enable refresh and force a refresh so docs are searchable immediately
+  await esRequest("PUT", `/${ES_INDEX}/_settings`, {
+    index: { refresh_interval: "1s" },
+  });
+  await esRequest("POST", `/${ES_INDEX}/_refresh`);
 
   THRESHOLD = count > LARGE_DATASET_CUTOFF
     ? PARAMS.THRESHOLD_LARGE
     : PARAMS.THRESHOLD_SMALL;
 }
 
-export async function search(query: string) {
-  if (!records.length) return [];
+// ==================================================
+// Search — ES candidate retrieval → scoreMatch filter
+// ==================================================
 
+export async function search(query: string): Promise<string[]> {
   trigramCache.clear();
 
   const norm = normalize(query);
@@ -585,66 +676,86 @@ export async function search(query: string) {
   if (!words.length) return [];
 
   const q: NameRecord = {
-    id: "",
-    rawName: query,
-    normName: norm,
+    id:        "",
+    rawName:   query,
+    normName:  norm,
     initials,
     words,
     firstWord: words[0],
-    lastWord: words[words.length - 1],
+    lastWord:  words[words.length - 1],
     wordCount: words.length,
   };
 
-  const candidateScores = new Map<number, number>();
-  const queryTrigrams = new Set<string>();
+  const qFirst = q.firstWord;
+  const qLast  = q.lastWord;
 
+  // Collect DM codes for the full query
+  const qDmCodes: string[] = [];
   for (const w of words)
-    for (const tg of trigrams(w))
-      queryTrigrams.add(tg);
+    for (const code of doubleMetaphone(w))
+      if (!qDmCodes.includes(code)) qDmCodes.push(code);
 
-  for (const tg of queryTrigrams) {
-    const indices = trigramIndex.get(tg);
-    if (!indices) continue;
-    for (const idx of indices)
-      candidateScores.set(idx, (candidateScores.get(idx) || 0) + 1);
+  // ── Build ES bool/should query ────────────────────────────────────────────
+  const shouldClauses: object[] = [
+    { match: { last_name:  { query: qLast,  fuzziness: "AUTO", boost: 3   } } },
+    { match: { first_name: { query: qFirst, fuzziness: "AUTO", boost: 2   } } },
+    { match: { last_name:  { query: qFirst, fuzziness: "AUTO", boost: 1.5 } } },
+    { match: { first_name: { query: qLast,  fuzziness: "AUTO", boost: 1   } } },
+    ...(qDmCodes.length ? [{ terms: { dm_codes: qDmCodes, boost: 1 } }] : []),
+  ];
+
+  for (const init of initials) {
+    shouldClauses.push({ prefix: { "first_name.keyword": { value: init, boost: 2 } } });
+    shouldClauses.push({ prefix: { "last_name.keyword":  { value: init, boost: 1 } } });
   }
 
-  // DM pass: add phonetic candidates not already found by trigrams.
-  // These are scored by the same threshold — DM only widens the candidate pool.
-  const dmCandidates = new Set<number>();
-  for (const w of words) {
-    for (const code of doubleMetaphone(w)) {
-      const indices = dmIndex.get(code);
-      if (!indices) continue;
-      for (const idx of indices) {
-        if (!candidateScores.has(idx)) dmCandidates.add(idx);
-      }
-    }
-  }
+  // ── Execute ES query via fetch ────────────────────────────────────────────
+  const resp = await esRequest("POST", `/${ES_INDEX}/_search`, {
+    query: {
+      bool: {
+        should:               shouldClauses,
+        minimum_should_match: 1,
+      },
+    },
+    size:    ES_CANDIDATE_SIZE,
+    _source: true,
+  });
 
-  const minMatches = Math.max(2, Math.floor(words.length * 1.2));
+  // ── Re-rank candidates through scoreMatch ─────────────────────────────────
   const results: string[] = [];
 
-  for (const [idx, score] of candidateScores) {
-    if (score < minMatches) continue;
-    if (scoreMatch(q, records[idx]) >= THRESHOLD)
-      results.push(records[idx].id);
-  }
+  for (const hit of resp.hits.hits as Array<{ _source: ESDoc }>) {
+    const doc = hit._source;
 
-  // Score DM-only candidates (no minMatches gate — DM is already selective)
-  for (const idx of dmCandidates) {
-    if (scoreMatch(q, records[idx]) >= THRESHOLD)
-      results.push(records[idx].id);
+    const rec: NameRecord = {
+      id:        doc.record_id,
+      rawName:   doc.rawName,
+      normName:  doc.normName,
+      initials:  doc.initials,
+      words:     doc.words,
+      firstWord: doc.firstWord,
+      lastWord:  doc.lastWord,
+      wordCount: doc.wordCount,
+    };
+
+    if (scoreMatch(q, rec) >= THRESHOLD) {
+      results.push(rec.id);
+    }
   }
 
   return results;
 }
 
-export async function cleanup() {
-  records = [];
-  trigramIndex.clear();
-  dmIndex.clear();
-  trigramCache.clear();
+// ==================================================
+// Cleanup — delete index (no client to close)
+// ==================================================
+
+export async function cleanup(): Promise<void> {
+  try {
+    await esRequest("DELETE", `/${ES_INDEX}`);
+  } catch {
+    // ignore if already gone
+  }
 }
 
 export default search;
