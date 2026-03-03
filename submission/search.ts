@@ -1,8 +1,10 @@
 // submission/search.ts
-// ES phonetic + fuzzy retrieval + strict local precision re-rank
+// In-memory phonetic + fuzzy retrieval + strict local precision re-rank
+
+import { doubleMetaphone } from "double-metaphone";
 
 // ==================================================
-// Tunable Parameters
+// Tunable Parameters (UNCHANGED)
 // ==================================================
 
 export const PARAMS = {
@@ -18,7 +20,6 @@ const INITIAL_SOFT  = 0.30;
 const INITIAL_HARD  = 0.0;
 
 const LARGE_DATASET_CUTOFF = 5000;
-const ES_CANDIDATE_SIZE    = 350; // slightly higher for recall safety
 
 // ==================================================
 // Types
@@ -35,39 +36,41 @@ interface NameRecord {
   wordCount: number;
 }
 
-interface ESDoc {
-  record_id: string;
-  rawName: string;
-  normName: string;
-  initials: string[];
-  words: string[];
-  firstWord: string;
-  lastWord: string;
-  wordCount: number;
-}
-
 // ==================================================
-// ES Connection
+// In-memory storage
 // ==================================================
 
-let ES_BASE  = (process.env.ES_URL ?? "http://localhost:9200").replace(/\/$/, "");
-let ES_INDEX = "names_search";
+let recordsById = new Map<string, NameRecord>();
+
+let exactFirst = new Map<string, string[]>();
+let exactLast  = new Map<string, string[]>();
+
+let phoneticFirst = new Map<string, string[]>();
+let phoneticLast  = new Map<string, string[]>();
+
+let initialFirst = new Map<string, string[]>();
+let initialLast  = new Map<string, string[]>();
+
 let THRESHOLD = PARAMS.THRESHOLD_SMALL;
 
-async function esRequest(method: string, path: string, body?: unknown) {
-  const res = await fetch(`${ES_BASE}${path}`, {
-    method,
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+// ==================================================
+// Index helpers
+// ==================================================
 
-  const text = await res.text();
-  if (!res.ok) throw new Error(`ES ${method} ${path} → ${res.status}: ${text}`);
-  return text ? JSON.parse(text) : {};
+function pushIndex(map: Map<string, string[]>, key: string, id: string) {
+  if (!key) return;
+  const arr = map.get(key);
+  if (arr) arr.push(id);
+  else map.set(key, [id]);
+}
+
+function metaphoneKey(word: string): string {
+  const [primary] = doubleMetaphone(word);
+  return primary || word;
 }
 
 // ==================================================
-// Normalization
+// Normalization (UNCHANGED)
 // ==================================================
 
 const SUFFIX_RE      = /\b(Jr\.?|Sr\.?|II|III|IV)\b/gi;
@@ -98,16 +101,18 @@ function normalize(name: string): string {
 function splitNorm(norm: string) {
   const initials: string[] = [];
   const words: string[] = [];
+
   for (const t of norm.split(" ")) {
     if (!t) continue;
     if (INITIAL_RE.test(t)) initials.push(t[0]);
     else if (t.length > 1) words.push(t);
   }
+
   return { initials, words };
 }
 
 // ==================================================
-// Similarity
+// Similarity (UNCHANGED)
 // ==================================================
 
 let trigramCache = new Map<string, Set<string>>();
@@ -128,26 +133,39 @@ function trigrams(s: string): Set<string> {
 function trigramJaccard(a: string, b: string) {
   const ta = trigrams(a);
   const tb = trigrams(b);
+
   let inter = 0;
   const [small, large] = ta.size < tb.size ? [ta, tb] : [tb, ta];
-  for (const t of small) if (large.has(t)) inter++;
+
+  for (const t of small)
+    if (large.has(t)) inter++;
+
   return inter / (ta.size + tb.size - inter);
 }
 
 function seqSim(a: string, b: string) {
   if (a === b) return 1;
-  const m = a.length, n = b.length;
-  if (!m || !n || Math.abs(m - n) > Math.max(m, n) * 0.7) return 0;
+
+  const m = a.length;
+  const n = b.length;
+
+  if (!m || !n || Math.abs(m - n) > Math.max(m, n) * 0.7)
+    return 0;
 
   const dp = new Int16Array(n + 1);
+
   for (let i = 0; i < m; i++) {
     let prev = 0;
     for (let j = 0; j < n; j++) {
       const tmp = dp[j + 1];
-      dp[j + 1] = a[i] === b[j] ? prev + 1 : Math.max(dp[j + 1], dp[j]);
+      dp[j + 1] =
+        a[i] === b[j]
+          ? prev + 1
+          : Math.max(dp[j + 1], dp[j]);
       prev = tmp;
     }
   }
+
   return (2 * dp[n]) / (m + n);
 }
 
@@ -155,7 +173,7 @@ const tokenSim = (a: string, b: string) =>
   (trigramJaccard(a, b) + seqSim(a, b)) / 2;
 
 // ==================================================
-// Scoring (unchanged logic)
+// Scoring (UNCHANGED LOGIC)
 // ==================================================
 
 function scoreMatch(q: NameRecord, r: NameRecord): number {
@@ -182,12 +200,12 @@ function scoreMatch(q: NameRecord, r: NameRecord): number {
     const qfw = q.words.filter(w => w !== qLN);
     const rfw = r.words.filter(w => w !== rLN);
 
-    let firstScore    = 0;
+    let firstScore = 0;
     let initialMatched = false;
 
     for (const init of q.initials)
       if (rfw[0]?.startsWith(init)) {
-        firstScore     = INITIAL_MATCH;
+        firstScore = INITIAL_MATCH;
         initialMatched = true;
         break;
       }
@@ -195,7 +213,7 @@ function scoreMatch(q: NameRecord, r: NameRecord): number {
     if (!initialMatched)
       for (const init of r.initials)
         if (qfw[0]?.startsWith(init)) {
-          firstScore     = INITIAL_MATCH;
+          firstScore = INITIAL_MATCH;
           initialMatched = true;
           break;
         }
@@ -245,63 +263,16 @@ function scoreMatch(q: NameRecord, r: NameRecord): number {
 // ==================================================
 
 export async function setup(datasetPath: string): Promise<void> {
-  ES_INDEX = `names_search_${Date.now()}`;
-
-  await esRequest("PUT", `/${ES_INDEX}`, {
-    settings: {
-      analysis: {
-        filter: {
-          my_metaphone: {
-            type: "phonetic",
-            encoder: "double_metaphone",
-            replace: true
-          }
-        },
-        analyzer: {
-          phonetic_analyzer: {
-            tokenizer: "standard",
-            filter: ["lowercase", "asciifolding", "my_metaphone"]
-          }
-        }
-      },
-      index: {
-        number_of_shards: 1,
-        number_of_replicas: 0,
-        refresh_interval: "-1"
-      }
-    },
-    mappings: {
-      properties: {
-        record_id: { type: "keyword" },
-        rawName:   { type: "keyword" },
-        normName:  { type: "keyword" },
-        initials:  { type: "keyword" },
-        words:     { type: "keyword" },
-        firstWord: { type: "keyword" },
-        lastWord:  { type: "keyword" },
-        wordCount: { type: "integer" },
-
-        first_name: {
-          type: "text",
-          fields: {
-            phonetic: { type: "text", analyzer: "phonetic_analyzer" },
-            keyword:  { type: "keyword" }
-          }
-        },
-        last_name: {
-          type: "text",
-          fields: {
-            phonetic: { type: "text", analyzer: "phonetic_analyzer" },
-            keyword:  { type: "keyword" }
-          }
-        }
-      }
-    }
-  });
+  recordsById.clear();
+  exactFirst.clear();
+  exactLast.clear();
+  phoneticFirst.clear();
+  phoneticLast.clear();
+  initialFirst.clear();
+  initialLast.clear();
 
   const lines = (await Bun.file(datasetPath).text()).split(/\r?\n/);
   let count = 0;
-  let batch: string[] = [];
 
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -312,6 +283,7 @@ export async function setup(datasetPath: string): Promise<void> {
 
     const id = line.slice(0, comma).trim();
     let rawName = line.slice(comma + 1).trim();
+
     if (rawName.startsWith('"') && rawName.endsWith('"'))
       rawName = rawName.slice(1, -1).replace(/""/g, '"');
 
@@ -319,8 +291,8 @@ export async function setup(datasetPath: string): Promise<void> {
     const { initials, words } = splitNorm(norm);
     if (!words.length) continue;
 
-    const doc = {
-      record_id: id,
+    const rec: NameRecord = {
+      id,
       rawName,
       normName: norm,
       initials,
@@ -328,37 +300,26 @@ export async function setup(datasetPath: string): Promise<void> {
       firstWord: words[0],
       lastWord: words[words.length - 1],
       wordCount: words.length,
-      first_name: words[0],
-      last_name: words[words.length - 1],
     };
 
-    batch.push(JSON.stringify({ index: { _index: ES_INDEX, _id: id } }));
-    batch.push(JSON.stringify(doc));
+    recordsById.set(id, rec);
+
+    pushIndex(exactFirst, rec.firstWord, id);
+    pushIndex(exactLast,  rec.lastWord,  id);
+
+    pushIndex(phoneticFirst, metaphoneKey(rec.firstWord), id);
+    pushIndex(phoneticLast,  metaphoneKey(rec.lastWord),  id);
+
+    pushIndex(initialFirst, rec.firstWord[0], id);
+    pushIndex(initialLast,  rec.lastWord[0],  id);
+
     count++;
-
-    if (batch.length >= 1000) {
-      await fetch(`${ES_BASE}/_bulk`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-ndjson" },
-        body: batch.join("\n") + "\n",
-      });
-      batch = [];
-    }
   }
 
-  if (batch.length) {
-    await fetch(`${ES_BASE}/_bulk`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-ndjson" },
-      body: batch.join("\n") + "\n",
-    });
-  }
-
-  await esRequest("POST", `/${ES_INDEX}/_refresh`);
-
-  THRESHOLD = count > LARGE_DATASET_CUTOFF
-    ? PARAMS.THRESHOLD_LARGE
-    : PARAMS.THRESHOLD_SMALL;
+  THRESHOLD =
+    count > LARGE_DATASET_CUTOFF
+      ? PARAMS.THRESHOLD_LARGE
+      : PARAMS.THRESHOLD_SMALL;
 }
 
 // ==================================================
@@ -383,54 +344,44 @@ export async function search(query: string): Promise<string[]> {
     wordCount: words.length,
   };
 
-  const should: any[] = [
-    { match: { last_name:  { query: q.lastWord,  fuzziness: "AUTO", boost: 3 } } },
-    { match: { first_name: { query: q.firstWord, fuzziness: "AUTO", boost: 2 } } },
-    { match: { last_name:  { query: q.firstWord, fuzziness: "AUTO", boost: 1.5 } } },
-    { match: { first_name: { query: q.lastWord,  fuzziness: "AUTO", boost: 1 } } },
+  const candidates = new Set<string>();
 
-    { match: { "last_name.phonetic":  { query: q.lastWord,  boost: 2 } } },
-    { match: { "first_name.phonetic": { query: q.firstWord, boost: 1.5 } } },
-    { match: { "last_name.phonetic":  { query: q.firstWord, boost: 1 } } },
-    { match: { "first_name.phonetic": { query: q.lastWord,  boost: 0.8 } } },
-  ];
+  const addAll = (arr?: string[]) => {
+    if (!arr) return;
+    for (const id of arr) candidates.add(id);
+  };
+
+  addAll(exactLast.get(q.lastWord));
+  addAll(exactFirst.get(q.firstWord));
+
+  addAll(exactLast.get(q.firstWord));
+  addAll(exactFirst.get(q.lastWord));
+
+  addAll(phoneticLast.get(metaphoneKey(q.lastWord)));
+  addAll(phoneticFirst.get(metaphoneKey(q.firstWord)));
 
   for (const i of initials) {
-    should.push({ prefix: { "first_name.keyword": { value: i, boost: 2 } } });
-    should.push({ prefix: { "last_name.keyword":  { value: i, boost: 1 } } });
+    addAll(initialFirst.get(i));
+    addAll(initialLast.get(i));
   }
-
-  const resp = await esRequest("POST", `/${ES_INDEX}/_search`, {
-    query: { bool: { should, minimum_should_match: 1 } },
-    size: ES_CANDIDATE_SIZE,
-  });
 
   const results: string[] = [];
 
-  for (const hit of resp.hits.hits as Array<{ _source: ESDoc }>) {
-    const doc = hit._source;
-
-    const rec: NameRecord = {
-      id: doc.record_id,
-      rawName: doc.rawName,
-      normName: doc.normName,
-      initials: doc.initials,
-      words: doc.words,
-      firstWord: doc.firstWord,
-      lastWord: doc.lastWord,
-      wordCount: doc.wordCount,
-    };
-
+  for (const id of candidates) {
+    const rec = recordsById.get(id)!;
     if (scoreMatch(q, rec) >= THRESHOLD)
-      results.push(rec.id);
+      results.push(id);
   }
 
   return results;
 }
 
+// ==================================================
+// Cleanup
+// ==================================================
+
 export async function cleanup(): Promise<void> {
-  try { await esRequest("DELETE", `/${ES_INDEX}`); }
-  catch {}
+  recordsById.clear();
 }
 
 export default search;
