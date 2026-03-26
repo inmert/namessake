@@ -1,5 +1,5 @@
 /**
- * submission/search.ts
+ * search.ts
  *
  * Public API: setup / search / cleanup
  *
@@ -14,17 +14,17 @@
  *    clusters that sneak in via phonetic indexing.
  */
 
-import { PARAMS, LARGE_DATASET_CUTOFF } from "./lib/params";
-import { normalize, splitNorm } from "./lib/normalize";
-import { clearTrigramCache } from "./lib/similarity";
 import {
+  PARAMS, LARGE_DATASET_CUTOFF,
+  normalize, splitNorm,
+  clearTrigramCache,
   recordsById, exactFirst, exactLast,
   phoneticFirst, phoneticLast,
   initialFirst, initialLast,
   surnameFreq, clearAll, indexRecord, metaphoneKey,
-} from "./lib/store";
-import { scoreMatch } from "./lib/score";
-import type { NameRecord } from "./lib/types";
+  scoreMatch,
+} from "./lib";
+import type { NameRecord } from "./lib";
 
 let THRESHOLD = PARAMS.THRESHOLD_SMALL;
 
